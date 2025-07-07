@@ -1,138 +1,135 @@
 #!/bin/bash
 
-LOGFILE="/var/log/erpnext15_install.log"
-exec > >(tee -a "$LOGFILE") 2>&1
+# Script to install ERPNext version 15 on Ubuntu, tailored for existing MariaDB setup
+# Logs to /var/log/erpnext_install.log
+# Run as root or with sudo
 
-set -euo pipefail
+# Exit on error
+set -e
 
-color() { echo -e "\033[$2m$1\033[0m"; }
-info() { color "[INFO] $1" "1;34"; }
-warn() { color "[WARN] $1" "1;33"; }
-error() { color "[ERROR] $1" "1;31"; }
+# Logging setup
+LOG_FILE="/var/log/erpnext_install.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[$(date)] Starting ERPNext installation..."
 
-trap 'error "Script failed at line $LINENO. Check the log: $LOGFILE"' ERR
-
-# User inputs
-read -p "Enter system username for Frappe (e.g., frappe): " FRAPPE_USER
-sudo adduser $FRAPPE_USER
-
-read -p "Enter site name (e.g., erp.mydomain.com): " SITE_NAME
-read -s -p "Enter MySQL root password to set: " MYSQL_ROOT_PWD
-echo
-read -s -p "Enter ERPNext Administrator password: " ADMIN_PASSWORD
-echo
-
-# Update & install dependencies
-info "Updating and installing base packages..."
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y git curl software-properties-common mariadb-server mariadb-client \
-  redis-server xvfb libfontconfig libxrender1 libxext6 libx11-dev \
-  zlib1g-dev libssl-dev libmysqlclient-dev python3-dev python3.10-dev python3-setuptools \
-  python3-pip python3-distutils python3.10-venv npm cron supervisor nginx || error "Dependency install failed."
-
-# Check essential services
-info "Checking required services..."
-for svc in mariadb redis-server nginx supervisor; do
-  if ! systemctl is-active --quiet $svc; then
-    warn "$svc is not running. Attempting to start..."
-    sudo systemctl restart $svc
-  else
-    info "$svc is running."
-  fi
-done
-
-# Install wkhtmltopdf (Qt patched)
-info "Installing wkhtmltopdf (Qt patched)..."
-if ! wkhtmltopdf -V 2>/dev/null | grep -q "0.12.6"; then
-  wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-  sudo apt install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-  rm wkhtmltox_0.12.6.1-2.jammy_amd64.deb
-else
-  info "wkhtmltopdf is already installed."
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: This script must be run as root or with sudo."
+    exit 1
 fi
 
-# MySQL secure setup
-info "Securing MariaDB..."
-sudo mysql -u root <<MYSQL_SCRIPT || warn "MySQL root user update skipped."
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PWD';
-DELETE FROM mysql.user WHERE User='';
-DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
-FLUSH PRIVILEGES;
-MYSQL_SCRIPT
+# Check disk space (minimum 40GB recommended)
+echo "[$(date)] Checking disk space..."
+if [ $(df -k / | tail -1 | awk '{print $4}') -lt 40000000 ]; then
+    echo "Error: Insufficient disk space. At least 40GB is recommended."
+    exit 1
+fi
 
-# Apply MariaDB charset fix
-info "Configuring MariaDB charset..."
-sudo tee /etc/mysql/my.cnf > /dev/null <<EOF
-[mysqld]
-character-set-client-handshake = FALSE
-character-set-server = utf8mb4
-collation-server = utf8mb4_unicode_ci
+# Prompt for backup
+echo "WARNING: Ensure you have backed up your MariaDB databases before proceeding."
+echo "Run 'mysqldump -u root -p --all-databases > backup.sql' to create a backup."
+read -p "Have you backed up your databases? (y/n): " backup_confirmed
+if [ "$backup_confirmed" != "y" ]; then
+    echo "Please back up your databases and try again."
+    exit 1
+fi
 
-[mysql]
-default-character-set = utf8mb4
-EOF
-sudo systemctl restart mariadb
+# Prompt for MariaDB root password
+read -s -p "Enter MariaDB root password: " DB_ROOT_PASSWORD
+echo
 
-# Node.js + Yarn for Frappe user
-info "Installing Node.js and Yarn..."
-sudo -u $FRAPPE_USER bash <<'EOF'
-cd ~
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-export NVM_DIR="$HOME/.nvm"
-source $NVM_DIR/nvm.sh
-nvm install 18
+# Prompt for ERPNext site name
+read -p "Enter ERPNext site name (e.g., site1.local): " SITE_NAME
+if [ -z "$SITE_NAME" ]; then
+    echo "Error: Site name cannot be empty."
+    exit 1
+fi
+
+# Check if MariaDB is running
+echo "[$(date)] Checking MariaDB service..."
+if ! systemctl is-active --quiet mariadb; then
+    echo "Error: MariaDB service is not running. Start it with 'sudo systemctl start mariadb'."
+    exit 1
+fi
+
+# Check for port conflicts (80 for nginx, 8000 for development)
+echo "[$(date)] Checking for port conflicts..."
+if netstat -tuln | grep -E ':80|:8000' > /dev/null; then
+    echo "Error: Ports 80 or 8000 are in use. Free them before proceeding."
+    exit 1
+fi
+
+# Update system and install dependencies
+echo "[$(date)] Updating system and installing dependencies..."
+apt update && apt upgrade -y
+apt install -y python3 python3-pip python3-dev python3-setuptools python3-venv \
+    redis-server nginx git curl nodejs supervisor wkhtmltopdf
 npm install -g yarn
-yarn add node-sass
-EOF
 
-# Bench setup
-info "Installing Frappe Bench and ERPNext apps..."
-sudo -u $FRAPPE_USER bash <<EOF
-cd ~
-pip3 install frappe-bench honcho
-bench init --frappe-branch version-15 frappe-bench
-cd frappe-bench
+# Install frappe-bench
+echo "[$(date)] Installing frappe-bench..."
+pip3 install --no-cache-dir frappe-bench
 
-bench new-site $SITE_NAME --admin-password $ADMIN_PASSWORD --mariadb-root-password $MYSQL_ROOT_PWD
-bench use $SITE_NAME
+# Create frappe user
+echo "[$(date)] Creating frappe user..."
+if ! id "frappe" &>/dev/null; then
+    adduser --disabled-password --gecos "" frappe
+    usermod -aG sudo frappe
+fi
 
-bench get-app payments
-bench get-app --branch version-15 erpnext
-bench get-app --branch version-15 hrms
-bench get-app chat
+# Set up bench directory
+echo "[$(date)] Setting up bench directory..."
+su - frappe -c "bench init --frappe-branch version-15 frappe-bench"
+cd /home/frappe/frappe-bench
 
-bench --site $SITE_NAME install-app erpnext
-bench --site $SITE_NAME install-app hrms
-bench --site $SITE_NAME install-app chat
+# Check if Galera is enabled and disable if not needed
+echo "[$(date)] Checking MariaDB Galera settings..."
+if grep -q "wsrep_on=ON" /etc/mysql/mariadb.conf.d/*; then
+    echo "Galera cluster detected. Disabling wsrep_on if not needed."
+    sed -i 's/wsrep_on=ON/wsrep_on=OFF/' /etc/mysql/mariadb.conf.d/*.cnf
+    systemctl restart mariadb
+fi
 
-bench update --reset || warn "bench update --reset had issues."
+# Create new ERPNext site
+echo "[$(date)] Creating new ERPNext site: $SITE_NAME..."
+su - frappe -c "bench new-site $SITE_NAME --db-root-password \"$DB_ROOT_PASSWORD\" --install-app erpnext --source https://github.com/frappe/erpnext --branch version-15"
 
-bench --site $SITE_NAME enable-scheduler
-bench --site $SITE_NAME set-maintenance-mode off
-EOF
+# Set up production
+echo "[$(date)] Configuring production environment..."
+sudo bench setup production frappe
+su - frappe -c "bench restart"
 
-# Fix permissions
-info "Fixing permissions for $FRAPPE_USER..."
-sudo chown -R $FRAPPE_USER:$FRAPPE_USER /home/$FRAPPE_USER
+# Install certbot for SSL (optional)
+echo "[$(date)] Installing certbot for SSL..."
+apt install -y python3-certbot-nginx
 
-# Setup NGINX and Supervisor
-info "Setting up NGINX and Supervisor..."
-sudo -u $FRAPPE_USER -H bash -c "cd ~/frappe-bench && bench setup nginx"
-sudo ln -sf /home/$FRAPPE_USER/frappe-bench/config/nginx.conf /etc/nginx/sites-enabled/frappe
-sudo nginx -t && sudo systemctl reload nginx
+# Set permissions
+echo "[$(date)] Setting permissions..."
+chown -R frappe:frappe /home/frappe/frappe-bench
+chmod -R 755 /home/frappe/frappe-bench
 
-sudo -u $FRAPPE_USER -H bash -c "cd ~/frappe-bench && bench setup supervisor"
-sudo ln -sf /home/$FRAPPE_USER/frappe-bench/config/supervisor.conf /etc/supervisor/conf.d/frappe.conf
-sudo supervisorctl reread
-sudo supervisorctl update
-sudo supervisorctl restart all
+# Save credentials
+echo "[$(date)] Saving credentials..."
+ADMIN_PASSWORD=$(su - frappe -c "cat /home/frappe/frappe-bench/sites/$SITE_NAME/site_config.json" | grep admin_password | awk -F'"' '{print $4}')
+echo "ERPNext credentials:" > /home/frappe/frappe_passwords.txt
+echo "Site: $SITE_NAME" >> /home/frappe/frappe_passwords.txt
+echo "Administrator Password: $ADMIN_PASSWORD" >> /home/frappe/frappe_passwords.txt
+echo "MariaDB Root Password: [Not saved for security]" >> /home/frappe/frappe_passwords.txt
+chown frappe:frappe /home/frappe/frappe_passwords.txt
 
-sudo systemctl enable nginx
-sudo systemctl enable supervisor
+# Verify services
+echo "[$(date)] Verifying services..."
+systemctl restart nginx supervisor
+if systemctl is-active --quiet nginx && systemctl is-active --quiet supervisor; then
+    echo "Services started successfully."
+else
+    echo "Error: Failed to start nginx or supervisor. Check logs in $LOG_FILE."
+    exit 1
+fi
 
-info "🎉 ERPNext 15, HRMS, and Chat installed successfully!"
-echo "🔗 Access ERPNext: http://<your_server_ip>/"
-echo "👤 Login: administrator"
-echo "🔑 Password: $ADMIN_PASSWORD"
-echo "📄 Log file saved to: $LOGFILE"
+# Final instructions
+echo "[$(date)] ERPNext installation complete!"
+echo "Access ERPNext at http://<server_ip> or http://$SITE_NAME:8000 (development mode)"
+echo "Login with Username: Administrator, Password: See /home/frappe/frappe_passwords.txt"
+echo "To enable SSL, run: sudo certbot --nginx -d <your_domain>"
+echo "Logs saved to $LOG_FILE"
