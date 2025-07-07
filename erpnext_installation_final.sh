@@ -12,6 +12,7 @@ error() { color "[ERROR] $1" "1;31"; }
 
 trap 'error "Script failed at line $LINENO. Check the log: $LOGFILE"' ERR
 
+# User inputs
 read -p "Enter system username for Frappe (e.g., frappe): " FRAPPE_USER
 sudo adduser $FRAPPE_USER
 
@@ -21,34 +22,38 @@ echo
 read -s -p "Enter ERPNext Administrator password: " ADMIN_PASSWORD
 echo
 
+# Update & install dependencies
 info "Updating and installing base packages..."
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y git curl software-properties-common mariadb-server mariadb-client \
-  redis-server xvfb libfontconfig libxrender1 libxext6 libjpeg62-turbo libx11-dev \
+  redis-server xvfb libfontconfig libxrender1 libxext6 libx11-dev \
   zlib1g-dev libssl-dev libmysqlclient-dev python3-dev python3.10-dev python3-setuptools \
   python3-pip python3-distutils python3.10-venv npm cron supervisor nginx || error "Dependency install failed."
 
+# Check essential services
 info "Checking required services..."
-for svc in mysql redis-server nginx supervisor; do
+for svc in mariadb redis-server nginx supervisor; do
   if ! systemctl is-active --quiet $svc; then
-    warn "$svc is not running. Restarting..."
+    warn "$svc is not running. Attempting to start..."
     sudo systemctl restart $svc
   else
     info "$svc is running."
   fi
 done
 
-info "Installing patched wkhtmltopdf..."
+# Install wkhtmltopdf (Qt patched)
+info "Installing wkhtmltopdf (Qt patched)..."
 if ! wkhtmltopdf -V 2>/dev/null | grep -q "0.12.6"; then
   wget https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
   sudo apt install -y ./wkhtmltox_0.12.6.1-2.jammy_amd64.deb
   rm wkhtmltox_0.12.6.1-2.jammy_amd64.deb
 else
-  info "wkhtmltopdf already installed."
+  info "wkhtmltopdf is already installed."
 fi
 
-info "Securing MySQL root user..."
-sudo mysql -u root <<MYSQL_SCRIPT || warn "MySQL setup skipped or failed. Check status manually."
+# MySQL secure setup
+info "Securing MariaDB..."
+sudo mysql -u root <<MYSQL_SCRIPT || warn "MySQL root user update skipped."
 ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PWD';
 DELETE FROM mysql.user WHERE User='';
 DROP DATABASE IF EXISTS test;
@@ -56,7 +61,8 @@ DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
 MYSQL_SCRIPT
 
-info "Tuning MySQL configuration..."
+# Apply MariaDB charset fix
+info "Configuring MariaDB charset..."
 sudo tee /etc/mysql/my.cnf > /dev/null <<EOF
 [mysqld]
 character-set-client-handshake = FALSE
@@ -66,9 +72,10 @@ collation-server = utf8mb4_unicode_ci
 [mysql]
 default-character-set = utf8mb4
 EOF
-sudo systemctl restart mysql
+sudo systemctl restart mariadb
 
-info "Installing Node.js & Yarn as $FRAPPE_USER..."
+# Node.js + Yarn for Frappe user
+info "Installing Node.js and Yarn..."
 sudo -u $FRAPPE_USER bash <<'EOF'
 cd ~
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -79,7 +86,8 @@ npm install -g yarn
 yarn add node-sass
 EOF
 
-info "Installing Frappe Bench and ERPNext..."
+# Bench setup
+info "Installing Frappe Bench and ERPNext apps..."
 sudo -u $FRAPPE_USER bash <<EOF
 cd ~
 pip3 install frappe-bench honcho
@@ -98,16 +106,17 @@ bench --site $SITE_NAME install-app erpnext
 bench --site $SITE_NAME install-app hrms
 bench --site $SITE_NAME install-app chat
 
-info "Running bench update --reset (to fix inconsistencies)"
-bench update --reset || warn "bench update encountered issues, check log"
+bench update --reset || warn "bench update --reset had issues."
 
 bench --site $SITE_NAME enable-scheduler
 bench --site $SITE_NAME set-maintenance-mode off
 EOF
 
-info "Fixing ownership for $FRAPPE_USER’s home and bench directory..."
+# Fix permissions
+info "Fixing permissions for $FRAPPE_USER..."
 sudo chown -R $FRAPPE_USER:$FRAPPE_USER /home/$FRAPPE_USER
 
+# Setup NGINX and Supervisor
 info "Setting up NGINX and Supervisor..."
 sudo -u $FRAPPE_USER -H bash -c "cd ~/frappe-bench && bench setup nginx"
 sudo ln -sf /home/$FRAPPE_USER/frappe-bench/config/nginx.conf /etc/nginx/sites-enabled/frappe
@@ -122,8 +131,8 @@ sudo supervisorctl restart all
 sudo systemctl enable nginx
 sudo systemctl enable supervisor
 
-info "🎉 ERPNext 15, HRMS, and Chat setup is complete!"
-echo "🔗 Access: http://<your_server_ip>/"
+info "🎉 ERPNext 15, HRMS, and Chat installed successfully!"
+echo "🔗 Access ERPNext: http://<your_server_ip>/"
 echo "👤 Login: administrator"
 echo "🔑 Password: $ADMIN_PASSWORD"
-echo "📄 Log file: $LOGFILE"
+echo "📄 Log file saved to: $LOGFILE"
